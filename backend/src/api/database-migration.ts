@@ -7,7 +7,7 @@ import cpfpRepository from '../repositories/CpfpRepository';
 import { RowDataPacket } from 'mysql2';
 
 class DatabaseMigration {
-  private static currentVersion = 116;
+  private static currentVersion = 118;
   private queryTimeout = 3600_000;
   private statisticsAddedIndexed = false;
   private uniqueLogs: string[] = [];
@@ -1292,6 +1292,24 @@ class DatabaseMigration {
       await this.$executeQuery(this.getCreateMinerNamesTableQuery(), await this.$checkIfTableExists('miner_names'));
       await this.$executeQuery(this.getCreateBlocksMinersTableQuery(), await this.$checkIfTableExists('blocks_miners'));
       await this.updateToSchemaVersion(116);
+    }
+
+    if (databaseSchemaVersion < 118 && isBitcoin === true) {
+      if (config.MEMPOOL.NETWORK === 'mainnet') {
+        // From the BLAKE2b fork onwards prices come from neoxa.exchange (BTCB2/USDC). Drop the BTC prices saved since then,
+        // the price updater refills them, and unlink the blocks so they get linked to the new prices
+        await this.$executeQuery(`
+          DELETE prices FROM prices
+          JOIN blocks ON blocks.height = ${Common.NEOXA_PRICE_START_HEIGHT} AND blocks.stale = 0
+          WHERE prices.time >= blocks.blockTimestamp
+        `);
+        await this.$executeQuery(`
+          DELETE blocks_prices FROM blocks_prices
+          LEFT JOIN prices ON prices.id = blocks_prices.price_id
+          WHERE prices.id IS NULL
+        `);
+      }
+      await this.updateToSchemaVersion(118);
     }
   }
 
