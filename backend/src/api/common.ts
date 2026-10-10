@@ -7,7 +7,7 @@ import { isIP } from 'net';
 import transactionUtils from './transaction-utils';
 import { isPoint } from '../utils/secp256k1';
 import logger from '../logger';
-import { getVarIntLength, opcodes, parseMultisigScript } from '../utils/bitcoin-script';
+import { getVarIntLength, opcodes, parseMultisigScript, unprovenPubkeyBytes } from '../utils/bitcoin-script';
 import { IEsploraApi } from './bitcoin/esplora-api.interface';
 
 // Bitcoin Core default policy settings
@@ -556,6 +556,33 @@ export class Common {
     ].includes(pubkey);
   }
 
+  /** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files) */
+  static hasUnprovenPubkeys(vin: IEsploraApi.Vin): boolean {
+    const witness = vin.witness || [];
+    switch (vin.prevout?.scriptpubkey_type) {
+      case 'v0_p2wsh':
+        return unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+      case 'p2sh': {
+        if (witness.length) {
+          // nested segwit spends run their witness script
+          return unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+        }
+        // otherwise the redeem script is the last push of the scriptsig
+        const pushes = (vin.scriptsig_asm || transactionUtils.convertScriptSigAsm(vin.scriptsig)).split(' ').filter(op => !op.startsWith('OP_'));
+        return unprovenPubkeyBytes(pushes[pushes.length - 1], pushes) > 0;
+      }
+      case 'v1_p2tr': {
+        const tapscript = transactionUtils.witnessToP2TRScript(witness);
+        return !!tapscript && unprovenPubkeyBytes(tapscript, witness) > 0;
+      }
+      case undefined:
+        // no prevouts, optimistically treat the last witness item as a witness script
+        return witness.length >= 2 && unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+      default:
+        return false;
+    }
+  }
+
   static isInscription(vin, flags): bigint {
     // in taproot, if the last witness item begins with 0x50, it's an annex
     const hasAnnex = vin.witness?.[vin.witness.length - 1].startsWith('50');
@@ -723,6 +750,7 @@ export class Common {
     const inValues = {};
     const outValues = {};
     let rbf = false;
+    let hasFakePubkey = false;
     for (const vin of tx.vin) {
       if (vin.sequence < 0xfffffffe) {
         rbf = true;
@@ -771,6 +799,8 @@ export class Common {
           }
         }
       }
+      // detect fake pubkeys in spent scripts (i.e. valid points that no signature can prove)
+      hasFakePubkey = hasFakePubkey || Common.hasUnprovenPubkeys(vin);
 
       // sighash flags
       if (vin.prevout?.scriptpubkey_type === 'v1_p2tr') {
@@ -791,7 +821,6 @@ export class Common {
     } else {
       flags |= TransactionFlags.no_rbf;
     }
-    let hasFakePubkey = false;
     let P2WSHCount = 0;
     let olgaSize = 0;
     for (const vout of tx.vout) {

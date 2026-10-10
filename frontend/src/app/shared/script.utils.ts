@@ -479,6 +479,135 @@ export function getVarIntLength(n: number): number {
   }
 }
 
+// unproven pubkeys a script may carry before the rest count as data (Bitcoin Knots policy)
+const MAX_UNPROVEN_PUBKEYS = 10;
+const MAX_PUBKEYS_PER_MULTISIG = 20;
+const COMPRESSED_PUBKEY_SIZE = 33;
+
+/**
+ * Bytes a script (hex) carries in pubkeys that no signature can prove, ported from Bitcoin Knots.
+ *
+ * A key in an m-of-n that nothing signs for authorizes nothing, so what it holds is payload rather
+ * than a spending condition. That is how BPUB publishes files, as 1-of-15 multisig witness scripts
+ * of ground secp256k1 points. Ordinary multisig carries a couple of such keys, hence the tolerance.
+ *
+ * @param stack the items that carry the spend's signatures, with the script last: the witness,
+ *              or the scriptSig pushes of a P2SH spend
+ */
+export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
+  // a script needs more than MAX_UNPROVEN_PUBKEYS pubkey pushes before anything counts
+  if (!script || script.length < (MAX_UNPROVEN_PUBKEYS + 1) * (COMPRESSED_PUBKEY_SIZE + 1) * 2) {
+    return 0;
+  }
+  const size = script.length / 2;
+  const byteAt = (i: number): number => parseInt(script.slice(i * 2, i * 2 + 2), 16);
+
+  let pubkeys = 0;
+  let provable = 0;
+  // the current run of adjacent pubkey pushes and the count that opened it, since only
+  // a well-formed <m> <pubkey>*n <n> OP_CHECKMULTISIG credits m
+  let runKeys = 0;
+  let runOpenedBy = -1;
+  // well-formed <m> <pubkey>*n <n> that end a branch, credited when OP_CHECKMULTISIG follows the
+  // conditional (unlike Knots, which charges federation scripts whose branches share one
+  // OP_CHECKMULTISIG, such as Liquid's former peg-out script)
+  let branchCredit = 0;
+  // keys in the current push run, which are dropped data rather than pubkeys if a drop balances it
+  let pushRunKeys = 0;
+  let insideNoop = 0;
+  let lastOpcode = opcodes.OP_INVALIDOPCODE;
+  let lastCount = -1;
+  let lastIsPush = false;
+
+  for (let pc = 0; pc < size;) {
+    const opcode = byteAt(pc++);
+    let pushSize = 0;
+    // the m or n of an m-of-n, which above 16 is a minimal one byte push rather than an OP_N
+    let count = -1;
+    if (opcode <= opcodes.OP_PUSHDATA4) {
+      if (opcode < opcodes.OP_PUSHDATA1) {
+        pushSize = opcode;
+      } else {
+        const width = opcode === opcodes.OP_PUSHDATA1 ? 1 : (opcode === opcodes.OP_PUSHDATA2 ? 2 : 4);
+        if (pc + width > size) {
+          return 0;
+        }
+        for (let i = width - 1; i >= 0; i--) {
+          pushSize = pushSize * 256 + byteAt(pc + i);
+        }
+        pc += width;
+      }
+      if (pc + pushSize > size) {
+        // unparsable scripts are all data anyway
+        return 0;
+      }
+      if (opcode === 1 && byteAt(pc) > 16 && byteAt(pc) <= MAX_PUBKEYS_PER_MULTISIG) {
+        count = byteAt(pc);
+      }
+      pc += pushSize;
+    } else if (opcode >= opcodes.OP_1 && opcode <= opcodes.OP_16) {
+      count = opcode - opcodes.OP_1 + 1;
+    }
+
+    if (insideNoop) {
+      // OP_FALSE OP_IF envelopes are inscriptions, not pubkeys
+      if (opcode === opcodes.OP_IF || opcode === opcodes.OP_NOTIF) {
+        insideNoop++;
+      } else if (opcode === opcodes.OP_ENDIF) {
+        insideNoop--;
+      }
+    } else if (opcode === opcodes.OP_IF && lastOpcode === opcodes.OP_FALSE) {
+      insideNoop = 1;
+    } else if (opcode <= opcodes.OP_PUSHDATA4 && (pushSize === COMPRESSED_PUBKEY_SIZE || pushSize === 65)) {
+      if (!runKeys) {
+        runOpenedBy = lastCount;
+      }
+      runKeys++;
+      pushRunKeys++;
+      pubkeys++;
+    } else if ((opcode === opcodes.OP_DROP || opcode === opcodes.OP_2DROP) && lastIsPush) {
+      pubkeys -= pushRunKeys;
+      runKeys = 0;
+    } else if (opcode === opcodes.OP_CHECKSIG || opcode === opcodes.OP_CHECKSIGVERIFY) {
+      provable++;
+      runKeys = 0;
+    } else if (opcode === opcodes.OP_CHECKMULTISIG || opcode === opcodes.OP_CHECKMULTISIGVERIFY) {
+      // padding or reordering the keys forfeits the credit
+      if (runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
+        provable += runOpenedBy;
+      } else if (lastOpcode === opcodes.OP_ENDIF) {
+        provable += branchCredit;
+      }
+      branchCredit = 0;
+      runKeys = 0;
+    } else if ((opcode === opcodes.OP_ELSE || opcode === opcodes.OP_ENDIF) && runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
+      branchCredit += runOpenedBy;
+      runKeys = 0;
+    } else if (count < 0) {
+      // a key count sits on both ends of a multisig, so only other opcodes break the run
+      runKeys = 0;
+    }
+
+    const isPush = opcode <= opcodes.OP_16 && opcode !== opcodes.OP_RESERVED;
+    if (!isPush) {
+      pushRunKeys = 0;
+    }
+    lastOpcode = opcode;
+    lastCount = count;
+    lastIsPush = isPush;
+  }
+
+  // a script can name more signatures than the spender supplies, including in branches that never
+  // run, so count the signature-shaped items of the spend (DER plus sighash byte, or BIP340)
+  if (stack?.length) {
+    const signatures = stack.slice(0, -1).filter(item => item.length >= 128 && item.length <= 146).length;
+    provable = Math.min(provable, signatures);
+  }
+
+  // an uncompressed key carries no more payload than a compressed one, since only x is free
+  return Math.max(0, pubkeys - provable - MAX_UNPROVEN_PUBKEYS) * COMPRESSED_PUBKEY_SIZE;
+}
+
 function powMod(x: bigint, power: number, modulo: bigint): bigint {
   for (let i = 0; i < power; i++) {
     x = (x * x) % modulo;
