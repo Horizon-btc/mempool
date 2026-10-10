@@ -1,5 +1,5 @@
 import { TransactionFlags } from '@app/shared/filters.utils';
-import { getVarIntLength, parseMultisigScript, isPoint, parseTapscriptMultisig, parseTapscriptUnanimousMultisig, ScriptInfo } from '@app/shared/script.utils';
+import { getVarIntLength, parseMultisigScript, isPoint, parseTapscriptMultisig, parseTapscriptUnanimousMultisig, ScriptInfo, unprovenPubkeyBytes } from '@app/shared/script.utils';
 import { Transaction, Vin, Vout } from '@interfaces/electrs.interface';
 import { CpfpInfo, RbfInfo, TransactionStripped } from '@interfaces/node-api.interface';
 import { StateService } from '@app/services/state.service';
@@ -819,6 +819,33 @@ export function isBurnKey(pubkey: string): boolean {
   ].includes(pubkey);
 }
 
+/** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files) */
+export function hasUnprovenPubkeys(vin: Vin): boolean {
+  const witness = vin.witness || [];
+  switch (vin.prevout?.scriptpubkey_type) {
+    case 'v0_p2wsh':
+      return unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+    case 'p2sh': {
+      if (witness.length) {
+        // nested segwit spends run their witness script
+        return unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+      }
+      // otherwise the redeem script is the last push of the scriptsig
+      const pushes = (vin.scriptsig_asm || convertScriptSigAsm(vin.scriptsig)).split(' ').filter(op => !op.startsWith('OP_'));
+      return unprovenPubkeyBytes(pushes[pushes.length - 1], pushes) > 0;
+    }
+    case 'v1_p2tr': {
+      const tapscript = witnessToP2TRScript(witness);
+      return !!tapscript && unprovenPubkeyBytes(tapscript, witness) > 0;
+    }
+    case undefined:
+      // no prevouts, optimistically treat the last witness item as a witness script
+      return witness.length >= 2 && unprovenPubkeyBytes(witness[witness.length - 1], witness) > 0;
+    default:
+      return false;
+  }
+}
+
 export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replacement?: boolean, height?: number, network?: string): bigint {
   let flags = tx.flags ? BigInt(tx.flags) : 0n;
 
@@ -853,6 +880,7 @@ export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replac
   const inValues = {};
   const outValues = {};
   let rbf = false;
+  let hasFakePubkey = false;
   for (const vin of tx.vin) {
     if (vin.sequence < 0xfffffffe) {
       rbf = true;
@@ -889,6 +917,8 @@ export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replac
         }
       } break;
     }
+    // detect fake pubkeys in spent scripts (i.e. valid points that no signature can prove)
+    hasFakePubkey = hasFakePubkey || hasUnprovenPubkeys(vin);
 
     // sighash flags
     if (vin.prevout?.scriptpubkey_type === 'v1_p2tr') {
@@ -909,7 +939,6 @@ export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replac
   } else {
     flags |= TransactionFlags.no_rbf;
   }
-  let hasFakePubkey = false;
   let P2WSHCount = 0;
   let olgaSize = 0;
   for (const vout of tx.vout) {
