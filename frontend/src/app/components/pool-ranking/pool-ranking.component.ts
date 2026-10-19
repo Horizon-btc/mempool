@@ -69,6 +69,9 @@ export class PoolRankingComponent implements OnInit {
    */
   private static readonly BAND_LIGHTEST = 0.84;
   private static readonly BAND_DARKEST = 0.58;
+  /** DATUM miners on AlphaPool that are run by the pool itself */
+  private static readonly ALPHAPOOL_OWN_MINERS = ['BlockBuster3000', 'Sweaty Beaver', 'Grumpy Pickle', 'Tofu Toes', 'MineWithMe', 'Soggy Waffle']
+    .map(name => PoolRankingComponent.normalizeName(name));
 
   @HostBinding('attr.dir') dir = 'ltr';
 
@@ -307,14 +310,23 @@ export class PoolRankingComponent implements OnInit {
    * the exact block counts.
    */
   private generateSliceBands(pool, poolColor: string, startAngle: number, endAngle: number): MinerBand[] {
-    const miners = pool.miners ?? [];
+    let miners = pool.miners ?? [];
+    let minerBlockCount = pool.minerBlockCount;
+    if (pool.slug === 'alphapool') {
+      // AlphaPool runs these gateways itself, so their blocks are counted as built by the pool
+      const ownMiners = miners.filter(miner => PoolRankingComponent.ALPHAPOOL_OWN_MINERS.includes(PoolRankingComponent.normalizeName(miner.name)));
+      miners = miners.filter(miner => !ownMiners.includes(miner));
+      if (minerBlockCount !== undefined) {
+        minerBlockCount -= ownMiners.reduce((sum, miner) => sum + miner.blockCount, 0);
+      }
+    }
     if (!miners.length || !pool.blockCount || endAngle <= startAngle) {
       return [];
     }
 
     const shown = miners.slice(0, PoolRankingComponent.MAX_MINER_BANDS);
     const shownBlocks = shown.reduce((sum, miner) => sum + miner.blockCount, 0);
-    const otherMinerBlocks = Math.max(0, (pool.minerBlockCount ?? shownBlocks) - shownBlocks);
+    const otherMinerBlocks = Math.max(0, (minerBlockCount ?? shownBlocks) - shownBlocks);
     const poolBlocks = Math.max(0, pool.blockCount - shownBlocks - otherMinerBlocks);
 
     const ordered: { name: string, blockCount: number }[] = [];
@@ -573,6 +585,11 @@ export class PoolRankingComponent implements OnInit {
 
   isEllipsisActive(e) {
     return (e.offsetWidth < e.scrollWidth);
+  }
+
+  /** Miner tags lose their punctuation in the coinbase, so names are compared on letters and digits only */
+  private static normalizeName(name: string): string {
+    return (name ?? '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
   }
 }
 
