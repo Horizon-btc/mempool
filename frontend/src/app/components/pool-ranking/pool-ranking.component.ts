@@ -60,8 +60,6 @@ export class PoolRankingComponent implements OnInit {
 
   /** The palette ECharts assigns pool slices from; yellow is reserved for the 'unknown' pool */
   private static readonly SERIES_COLORS = chartColors.filter(color => color !== '#FDD835');
-  /** At most this many miners get their own band in a pool's slice */
-  private static readonly MAX_MINER_BANDS = 8;
   /**
    * Lightness the first band is drawn at and the floor the last one darkens to. The floor is
    * what keeps the deepest palette colours (navy, indigo, purple) off the page background: at
@@ -324,8 +322,7 @@ export class PoolRankingComponent implements OnInit {
       return [];
     }
 
-    const shown = miners.slice(0, PoolRankingComponent.MAX_MINER_BANDS);
-    const shownBlocks = shown.reduce((sum, miner) => sum + miner.blockCount, 0);
+    const shownBlocks = miners.reduce((sum, miner) => sum + miner.blockCount, 0);
     const otherMinerBlocks = Math.max(0, (minerBlockCount ?? shownBlocks) - shownBlocks);
     const poolBlocks = Math.max(0, pool.blockCount - shownBlocks - otherMinerBlocks);
 
@@ -336,7 +333,7 @@ export class PoolRankingComponent implements OnInit {
     if (otherMinerBlocks > 0) {
       ordered.push({ name: $localize`:@@mining.other-miners:Other miners`, blockCount: otherMinerBlocks });
     }
-    ordered.push(...shown);
+    ordered.push(...miners);
     // innermost first, smallest to largest, so the biggest band ends up on the rim, looks much nicer
     ordered.sort((a, b) => a.blockCount - b.blockCount);
 
