@@ -211,8 +211,9 @@ const COMPRESSED_PUBKEY_SIZE = 33;
  * Bytes a script (hex) carries in pubkeys that no signature can prove, ported from Bitcoin Knots.
  *
  * A key in an m-of-n that nothing signs for authorizes nothing, so what it holds is payload rather
- * than a spending condition. That is how BPUB publishes files, as 1-of-15 multisig witness scripts
- * of ground secp256k1 points. Ordinary multisig carries a couple of such keys, hence the tolerance.
+ * than a spending condition. Ordinary multisig carries a couple of such keys, hence the tolerance.
+ * BPUB publishes files in such keys too, but as 1-of-n witness scripts with n as small as 2, so a
+ * single BPUB script usually stays within the tolerance; hasBpubAnchors detects those per transaction.
  *
  * @param stack the items that carry the spend's signatures, with the script last: the witness,
  *              or the scriptSig pushes of a P2SH spend
@@ -323,12 +324,98 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
   // a script can name more signatures than the spender supplies, including in branches that never
   // run, so count the signature-shaped items of the spend (DER plus sighash byte, or BIP340)
   if (stack?.length) {
-    const signatures = stack.slice(0, -1).filter(item => item.length >= 128 && item.length <= 146).length;
-    provable = Math.min(provable, signatures);
+    provable = Math.min(provable, countSignatures(stack));
   }
 
   // an uncompressed key carries no more payload than a compressed one, since only x is free
   return Math.max(0, pubkeys - provable - MAX_UNPROVEN_PUBKEYS) * COMPRESSED_PUBKEY_SIZE;
+}
+
+// BPUB v5 stream header: 4-byte length, version, flags, 8-byte size, 32-byte sha256, 2-byte meta length
+const BPUB_VERSION = 5;
+const BPUB_HEADER_SIZE = 4 + 1 + 1 + 8 + 32 + 2;
+const BPUB_KNOWN_FLAGS = 0x03;
+const BPUB_CHUNK_SIZE = 31;
+// a stream fits in one transaction, so its length is bounded by the block weight limit
+const BPUB_MAX_STREAM_SIZE = 4_000_000;
+
+/**
+ * Parses a BPUB data anchor, `OP_1 <data pubkey>*(n-1) <control pubkey> OP_n OP_CHECKMULTISIG`,
+ * returning its data pubkeys and the control pubkey (the only key that ever signs, always last).
+ * Any 1-of-n with n >= 2 has this shape, so this alone does not mean the script carries data.
+ */
+export function parseBpubMultisig(script: string): undefined | { dataKeys: string[], controlKey: string } {
+  // OP_1 <33-byte push>*n OP_n OP_CHECKMULTISIG, with n >= 2
+  if (!script || script.length % 2 || script.length < (3 + 2 * 34) * 2 || script.slice(0, 2) !== '51' || script.slice(-2) !== 'ae') {
+    return;
+  }
+  const n = parseInt(script.slice(-4, -2), 16) - opcodes.OP_1 + 1;
+  if (n < 2 || n > 16 || script.length !== (3 + n * 34) * 2) {
+    return;
+  }
+  const keys: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const offset = 2 + i * 68;
+    if (script.slice(offset, offset + 2) !== '21') {
+      return;
+    }
+    keys.push(script.slice(offset + 2, offset + 68));
+  }
+  return { dataKeys: keys.slice(0, -1), controlKey: keys[n - 1] };
+}
+
+/**
+ * Whether the data pubkeys of a transaction's BPUB anchors, in input order, open a BPUB v5 stream:
+ * each key is a prefix byte, 31 bytes of stream and a nonce byte, and the stream starts with its
+ * length (32-bit big endian, counting from the version byte) followed by version 5, known flags and
+ * a metadata length that fits. Only the header is checked, so a partial view of the transaction
+ * (e.g. its first input) still matches; a real pubkey passes this by chance about once in 10^7.
+ */
+export function isBpubStream(dataKeys: string[]): boolean {
+  if (dataKeys.length * BPUB_CHUNK_SIZE < BPUB_HEADER_SIZE) {
+    return false;
+  }
+  const header = dataKeys.slice(0, Math.ceil(BPUB_HEADER_SIZE / BPUB_CHUNK_SIZE)).map(key => key.slice(2, 64)).join('');
+  const byteAt = (i: number): number => parseInt(header.slice(i * 2, i * 2 + 2), 16);
+  const bodyLength = parseInt(header.slice(0, 8), 16);
+  const metaLength = byteAt(46) * 256 + byteAt(47);
+  return bodyLength >= BPUB_HEADER_SIZE - 4
+    && bodyLength <= BPUB_MAX_STREAM_SIZE
+    && byteAt(4) === BPUB_VERSION
+    && (byteAt(5) & ~BPUB_KNOWN_FLAGS) === 0
+    && BPUB_HEADER_SIZE + metaLength <= 4 + bodyLength;
+}
+
+/**
+ * Whether a transaction's inputs publish data as BPUB, given the witness scripts its inputs reveal
+ * (in input order, with the number of signature-shaped items each spend supplies).
+ *
+ * BPUB splits a file over the data pubkeys of many 1-of-n witness scripts that all share one control
+ * key, with n as low as the file needs (e.g. 1-of-11 or 1-of-6). Each script stays within the
+ * per-script tolerance of unprovenPubkeyBytes, so the anchors are judged together instead: grouped by
+ * control key, a group is BPUB if its data keys open a BPUB v5 stream, or if it carries more data keys
+ * than a single script may leave unproven while using 1-of-n with n >= 3 (ordinary multisig is
+ * almost never 1-of-n, and does not share one control key across its other keys).
+ */
+export function hasBpubAnchors(scripts: { script: string, signatures: number }[]): boolean {
+  const groups: { [controlKey: string]: { dataKeys: string[], wide: number } } = {};
+  for (const { script, signatures } of scripts) {
+    const anchor = signatures <= 1 ? parseBpubMultisig(script) : undefined;
+    if (!anchor) {
+      continue;
+    }
+    const group = groups[anchor.controlKey] || (groups[anchor.controlKey] = { dataKeys: [], wide: 0 });
+    group.dataKeys.push(...anchor.dataKeys);
+    if (anchor.dataKeys.length >= 2) {
+      group.wide += anchor.dataKeys.length;
+    }
+  }
+  return Object.values(groups).some(group => group.wide > MAX_UNPROVEN_PUBKEYS || isBpubStream(group.dataKeys));
+}
+
+/** the number of signature-shaped items (DER plus sighash byte, or BIP340) a spend supplies, script last */
+export function countSignatures(stack: string[]): number {
+  return stack.slice(0, -1).filter(item => item.length >= 128 && item.length <= 146).length;
 }
 
 /**
