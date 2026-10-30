@@ -1,5 +1,5 @@
 import { TransactionFlags } from '@app/shared/filters.utils';
-import { getVarIntLength, parseMultisigScript, isPoint, parseTapscriptMultisig, parseTapscriptUnanimousMultisig, ScriptInfo, unprovenPubkeyBytes } from '@app/shared/script.utils';
+import { getVarIntLength, parseMultisigScript, isPoint, parseTapscriptMultisig, parseTapscriptUnanimousMultisig, ScriptInfo, unprovenPubkeyBytes, hasBpubAnchors, countSignatures } from '@app/shared/script.utils';
 import { Transaction, Vin, Vout } from '@interfaces/electrs.interface';
 import { CpfpInfo, RbfInfo, TransactionStripped } from '@interfaces/node-api.interface';
 import { StateService } from '@app/services/state.service';
@@ -819,6 +819,20 @@ export function isBurnKey(pubkey: string): boolean {
   ].includes(pubkey);
 }
 
+/** detects files published as BPUB, whose 1-of-n witness scripts may each carry only a few data pubkeys */
+export function hasBpubData(tx: Transaction): boolean {
+  const scripts: { script: string, signatures: number }[] = [];
+  for (const vin of tx.vin) {
+    const witness = vin.witness || [];
+    const type = vin.prevout?.scriptpubkey_type;
+    // witness scripts of p2wsh, nested p2wsh, or (without prevouts) maybe either
+    if (witness.length >= 2 && (type === 'v0_p2wsh' || type === 'p2sh' || type === undefined)) {
+      scripts.push({ script: witness[witness.length - 1], signatures: countSignatures(witness) });
+    }
+  }
+  return scripts.length > 0 && hasBpubAnchors(scripts);
+}
+
 /** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files) */
 export function hasUnprovenPubkeys(vin: Vin): boolean {
   const witness = vin.witness || [];
@@ -934,6 +948,8 @@ export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replac
     }
     inValues[vin.prevout?.value || Math.random()] = (inValues[vin.prevout?.value || Math.random()] || 0) + 1;
   }
+  // BPUB spreads its data pubkeys over the inputs, so judge their scripts together
+  hasFakePubkey = hasFakePubkey || hasBpubData(tx);
   if (rbf) {
     flags |= TransactionFlags.rbf;
   } else {

@@ -7,7 +7,7 @@ import { isIP } from 'net';
 import transactionUtils from './transaction-utils';
 import { isPoint } from '../utils/secp256k1';
 import logger from '../logger';
-import { getVarIntLength, opcodes, parseMultisigScript, unprovenPubkeyBytes } from '../utils/bitcoin-script';
+import { getVarIntLength, opcodes, parseMultisigScript, unprovenPubkeyBytes, hasBpubAnchors, countSignatures } from '../utils/bitcoin-script';
 import { IEsploraApi } from './bitcoin/esplora-api.interface';
 
 // Bitcoin Core default policy settings
@@ -556,6 +556,20 @@ export class Common {
     ].includes(pubkey);
   }
 
+  /** detects files published as BPUB, whose 1-of-n witness scripts may each carry only a few data pubkeys */
+  static hasBpubData(tx: IEsploraApi.Transaction): boolean {
+    const scripts: { script: string, signatures: number }[] = [];
+    for (const vin of tx.vin) {
+      const witness = vin.witness || [];
+      const type = vin.prevout?.scriptpubkey_type;
+      // witness scripts of p2wsh, nested p2wsh, or (without prevouts) maybe either
+      if (witness.length >= 2 && (type === 'v0_p2wsh' || type === 'p2sh' || type === undefined)) {
+        scripts.push({ script: witness[witness.length - 1], signatures: countSignatures(witness) });
+      }
+    }
+    return scripts.length > 0 && hasBpubAnchors(scripts);
+  }
+
   /** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files) */
   static hasUnprovenPubkeys(vin: IEsploraApi.Vin): boolean {
     const witness = vin.witness || [];
@@ -816,6 +830,8 @@ export class Common {
       }
       inValues[vin.prevout?.value || Math.random()] = (inValues[vin.prevout?.value || Math.random()] || 0) + 1;
     }
+    // BPUB spreads its data pubkeys over the inputs, so judge their scripts together
+    hasFakePubkey = hasFakePubkey || Common.hasBpubData(tx);
     if (rbf) {
       flags |= TransactionFlags.rbf;
     } else {
