@@ -492,6 +492,12 @@ const COMPRESSED_PUBKEY_SIZE = 33;
  * BPUB publishes files in such keys too, but as 1-of-n witness scripts with n as small as 2, so a
  * single BPUB script usually stays within the tolerance; hasBpubAnchors detects those per transaction.
  *
+ * A check proves only the key written directly in front of it, and only when that check runs and its
+ * result is kept. Bare OP_CHECKSIGs, checks whose result is dropped, and checks in a branch that
+ * cannot run are the decoy from Bitcoin Knots #470: they make the data keys of a following multisig
+ * look proven without a signature ever being verified against them. The same key bytes proven once
+ * are proven wherever else they occur.
+ *
  * @param stack the items that carry the spend's signatures, with the script last: the witness,
  *              or the scriptSig pushes of a P2SH spend
  */
@@ -503,8 +509,11 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
   const size = script.length / 2;
   const byteAt = (i: number): number => parseInt(script.slice(i * 2, i * 2 + 2), 16);
 
-  let pubkeys = 0;
-  let provable = 0;
+  // every pubkey push, in order, so a key proven once covers every copy of the same bytes
+  const occurrences: string[] = [];
+  // keys a live check names, in the order the checks appear
+  const provenChecks: string[] = [];
+  let multisigCredit = 0;
   // the current run of adjacent pubkey pushes and the count that opened it, since only
   // a well-formed <m> <pubkey>*n <n> OP_CHECKMULTISIG credits m
   let runKeys = 0;
@@ -519,6 +528,52 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
   let lastOpcode = opcodes.OP_INVALIDOPCODE;
   let lastCount = -1;
   let lastIsPush = false;
+  let lastWasKey = false;
+  let lastKeyHex = '';
+
+  // which conditional arms can run. A known-false arm is where a decoy hides its OP_CHECKSIGs;
+  // an unknown condition credits both arms, which is what the static count did.
+  const frames: { thenLive: boolean | null, inElse: boolean, opaque: boolean }[] = [];
+  const regionIsDead = (): boolean => frames.some(frame => frame.opaque
+    || (frame.thenLive === false && !frame.inElse)
+    || (frame.thenLive === true && frame.inElse));
+  // abstract stack, enough to evaluate the constant guards of a decoy (OP_1 OP_NOTIF,
+  // OP_DEPTH OP_0NOTEQUAL OP_NOTIF, OP_IF of an empty witness item). null is an unknown value.
+  type Item = { truth: boolean | null };
+  let lost = false;
+  let items: Item[] = [];
+  if (stack && stack[stack.length - 1] === script) {
+    items = stack.slice(0, -1).map(item => ({ truth: item.length > 0 }));
+  } else if (stack) {
+    lost = true;
+  }
+  const pushItem = (truth: boolean | null): void => {
+    if (truth === null) {
+      lost = true;
+      items = [];
+      return;
+    }
+    if (lost) {
+      items = [{ truth: null }, { truth }];
+      lost = false;
+      return;
+    }
+    items.push({ truth });
+  };
+  const popItem = (): Item => {
+    if (lost || !items.length) {
+      lost = true;
+      items = [];
+      return { truth: null };
+    }
+    const top = items.pop();
+    if (!top || top.truth === null) {
+      lost = true;
+      items = [];
+      return { truth: null };
+    }
+    return top;
+  };
 
   for (let pc = 0; pc < size;) {
     const opcode = byteAt(pc++);
@@ -550,6 +605,11 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
       count = opcode - opcodes.OP_1 + 1;
     }
 
+    const dead = insideNoop > 0 || regionIsDead();
+    const keyHex = (opcode <= opcodes.OP_PUSHDATA4 && (pushSize === COMPRESSED_PUBKEY_SIZE || pushSize === 65))
+      ? script.slice((pc - pushSize) * 2, pc * 2)
+      : '';
+
     if (insideNoop) {
       // OP_FALSE OP_IF envelopes are inscriptions, not pubkeys
       if (opcode === opcodes.OP_IF || opcode === opcodes.OP_NOTIF) {
@@ -559,29 +619,39 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
       }
     } else if (opcode === opcodes.OP_IF && lastOpcode === opcodes.OP_FALSE) {
       insideNoop = 1;
-    } else if (opcode <= opcodes.OP_PUSHDATA4 && (pushSize === COMPRESSED_PUBKEY_SIZE || pushSize === 65)) {
+    } else if (keyHex) {
       if (!runKeys) {
         runOpenedBy = lastCount;
       }
       runKeys++;
       pushRunKeys++;
-      pubkeys++;
-    } else if ((opcode === opcodes.OP_DROP || opcode === opcodes.OP_2DROP) && lastIsPush) {
-      pubkeys -= pushRunKeys;
+      occurrences.push(keyHex);
+    } else if (!dead && (opcode === opcodes.OP_DROP || opcode === opcodes.OP_2DROP) && lastIsPush) {
+      // a drop that runs spends the pushes as data, which is counted on its own. One that never
+      // runs leaves the pushes in the script, so they stay keys.
+      for (let i = 0; i < pushRunKeys; i++) {
+        occurrences.pop();
+      }
       runKeys = 0;
     } else if (opcode === opcodes.OP_CHECKSIG || opcode === opcodes.OP_CHECKSIGVERIFY) {
-      provable++;
+      // a dropped result cannot fail the script, so an empty signature satisfies it and proves nothing
+      const next = pc < size ? byteAt(pc) : -1;
+      const discarded = opcode === opcodes.OP_CHECKSIG && (next === opcodes.OP_DROP || next === opcodes.OP_2DROP);
+      if (!dead && lastWasKey && !discarded) {
+        provenChecks.push(lastKeyHex);
+      }
       runKeys = 0;
     } else if (opcode === opcodes.OP_CHECKMULTISIG || opcode === opcodes.OP_CHECKMULTISIGVERIFY) {
-      // padding or reordering the keys forfeits the credit
-      if (runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
-        provable += runOpenedBy;
-      } else if (lastOpcode === opcodes.OP_ENDIF) {
-        provable += branchCredit;
+      // padding or reordering the keys forfeits the credit. A check in code that does not run
+      // verifies nothing, so a multisig there credits no keys either.
+      if (!dead && runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
+        multisigCredit += runOpenedBy;
+      } else if (!dead && lastOpcode === opcodes.OP_ENDIF) {
+        multisigCredit += branchCredit;
       }
       branchCredit = 0;
       runKeys = 0;
-    } else if ((opcode === opcodes.OP_ELSE || opcode === opcodes.OP_ENDIF) && runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
+    } else if ((opcode === opcodes.OP_ELSE || opcode === opcodes.OP_ENDIF) && !dead && runOpenedBy > 0 && lastCount > 0 && lastCount === runKeys) {
       branchCredit += runOpenedBy;
       runKeys = 0;
     } else if (count < 0) {
@@ -589,23 +659,102 @@ export function unprovenPubkeyBytes(script: string, stack?: string[]): number {
       runKeys = 0;
     }
 
+    // the condition is consumed by the opcode itself, which is why a dead arm does not touch the stack
+    if (opcode === opcodes.OP_IF || opcode === opcodes.OP_NOTIF) {
+      let thenLive: boolean | null = null;
+      if (!dead) {
+        const condition = popItem();
+        thenLive = condition.truth === null ? null : (opcode === opcodes.OP_NOTIF ? !condition.truth : condition.truth);
+      }
+      frames.push({ thenLive, inElse: false, opaque: dead });
+    } else if (opcode === opcodes.OP_ELSE) {
+      const frame = frames[frames.length - 1];
+      if (frame && !frame.opaque) {
+        frame.inElse = true;
+      }
+    } else if (opcode === opcodes.OP_ENDIF) {
+      frames.pop();
+    } else if (!dead) {
+      if (opcode <= opcodes.OP_PUSHDATA4) {
+        pushItem(pushSize > 0);
+      } else if (opcode === opcodes.OP_1NEGATE || (opcode >= opcodes.OP_1 && opcode <= opcodes.OP_16)) {
+        pushItem(true);
+      } else if (opcode === opcodes.OP_DEPTH) {
+        pushItem(!lost && items.every(item => item.truth !== null) ? items.length > 0 : null);
+      } else if (opcode === opcodes.OP_0NOTEQUAL) {
+        const top = popItem();
+        pushItem(top.truth);
+      } else if (opcode === opcodes.OP_NOT) {
+        const top = popItem();
+        pushItem(top.truth === null ? null : !top.truth);
+      } else if (opcode === opcodes.OP_DROP) {
+        popItem();
+      } else if (opcode === opcodes.OP_2DROP) {
+        popItem();
+        popItem();
+      } else if (opcode === opcodes.OP_DUP) {
+        const top = popItem();
+        pushItem(top.truth);
+        pushItem(top.truth);
+      } else if (opcode === opcodes.OP_2DUP) {
+        const b = popItem();
+        const a = popItem();
+        pushItem(a.truth);
+        pushItem(b.truth);
+        pushItem(a.truth);
+        pushItem(b.truth);
+      } else if (opcode === opcodes.OP_SWAP) {
+        const b = popItem();
+        const a = popItem();
+        pushItem(b.truth);
+        pushItem(a.truth);
+      } else if (opcode === opcodes.OP_CHECKSIG) {
+        popItem();
+        popItem();
+        pushItem(null);
+      } else if (opcode === opcodes.OP_CHECKSIGVERIFY) {
+        popItem();
+        popItem();
+      } else if (opcode !== opcodes.OP_NOP && opcode !== opcodes.OP_CHECKLOCKTIMEVERIFY && opcode !== opcodes.OP_CHECKSEQUENCEVERIFY) {
+        lost = true;
+        items = [];
+      }
+    }
+
     const isPush = opcode <= opcodes.OP_16 && opcode !== opcodes.OP_RESERVED;
     if (!isPush) {
       pushRunKeys = 0;
+    }
+    lastWasKey = !!keyHex && !dead;
+    if (lastWasKey) {
+      lastKeyHex = keyHex;
     }
     lastOpcode = opcode;
     lastCount = count;
     lastIsPush = isPush;
   }
 
-  // a script can name more signatures than the spender supplies, including in branches that never
-  // run, so count the signature-shaped items of the spend (DER plus sighash byte, or BIP340)
-  if (stack?.length) {
-    provable = Math.min(provable, countSignatures(stack));
+  // one signature proves one key. Further copies of those bytes carry no new payload, and the
+  // threshold of a multisig covers that many of the keys no check named. Checks a decoy added
+  // on top of the real signatures never reach here, so they cannot spend this budget.
+  let budget = stack ? countSignatures(stack) : Number.POSITIVE_INFINITY;
+  const proven = new Set<string>();
+  for (const key of provenChecks) {
+    if (budget <= 0) {
+      break;
+    }
+    budget--;
+    proven.add(key);
   }
-
+  let rest = 0;
+  for (const key of occurrences) {
+    if (!proven.has(key)) {
+      rest++;
+    }
+  }
+  const unproven = Math.max(0, rest - Math.min(multisigCredit, budget));
   // an uncompressed key carries no more payload than a compressed one, since only x is free
-  return Math.max(0, pubkeys - provable - MAX_UNPROVEN_PUBKEYS) * COMPRESSED_PUBKEY_SIZE;
+  return Math.max(0, unproven - MAX_UNPROVEN_PUBKEYS) * COMPRESSED_PUBKEY_SIZE;
 }
 
 // BPUB v5 stream header: 4-byte length, version, flags, 8-byte size, 32-byte sha256, 2-byte meta length

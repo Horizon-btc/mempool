@@ -833,7 +833,7 @@ export function hasBpubData(tx: Transaction): boolean {
   return scripts.length > 0 && hasBpubAnchors(scripts);
 }
 
-/** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files) */
+/** detects pubkeys that no signature can prove in the script an input spends (e.g. BPUB files, or keys a decoy check only pretends to prove) */
 export function hasUnprovenPubkeys(vin: Vin): boolean {
   const witness = vin.witness || [];
   switch (vin.prevout?.scriptpubkey_type) {
@@ -931,7 +931,7 @@ export function getTransactionFlags(tx: Transaction, cpfpInfo?: CpfpInfo, replac
         }
       } break;
     }
-    // detect fake pubkeys in spent scripts (i.e. valid points that no signature can prove)
+    // detect fake pubkeys in spent scripts (data keys, including ones a decoy check only pretends to prove)
     hasFakePubkey = hasFakePubkey || hasUnprovenPubkeys(vin);
 
     // sighash flags
